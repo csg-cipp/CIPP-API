@@ -18,10 +18,24 @@ function Get-CIPPAuthentication {
                     Set-Item -Path env:$Var -Value $Secret.$Var -Force -ErrorAction Stop
                 }
             }
+            Write-Host "Got secrets from dev storage. ApplicationID: $env:ApplicationID"
         } else {
+            Write-Information 'Connecting to Azure'
             Connect-AzAccount -Identity
             $SubscriptionId = $env:WEBSITE_OWNER_NAME -split '\+' | Select-Object -First 1
-            $null = Set-AzContext -SubscriptionId $SubscriptionId
+            try {
+                $Context = Get-AzContext
+                if ($Context.Subscription) {
+                    #Write-Information "Current context: $($Context | ConvertTo-Json)"
+                    if ($Context.Subscription.Id -ne $SubscriptionId) {
+                        Write-Information "Setting context to subscription $SubscriptionId"
+                        $null = Set-AzContext -SubscriptionId $SubscriptionId
+                    }
+                }
+            } catch {
+                Write-Information "ERROR: Could not set context to subscription $SubscriptionId."
+            }
+
             $keyvaultname = ($env:WEBSITE_DEPLOYMENT_ID -split '-')[0]
             $Variables | ForEach-Object {
                 Set-Item -Path env:$_ -Value (Get-AzKeyVaultSecret -VaultName $keyvaultname -Name $_ -AsPlainText -ErrorAction Stop) -Force
