@@ -1,0 +1,151 @@
+# FORK-ONLY workflow for csg-cipp/CIPP-API: builds the CIPP-API container image and
+# publishes it to GHCR on every push to master — including the merge commits pull[bot]
+# creates when syncing upstream (KelvinTegelaar/CIPP-API, see .github/pull.yml).
+#
+# Fork-only file: survives pull[bot] merges (mergeMethod "merge"); CSG-prefixed filename
+# avoids an add/add conflict if upstream ever ships their own container workflow.
+#
+# Tags published per build (version from version_latest.txt):
+#   :latest          <- channel tag the app runs
+#   :<version>       <- e.g. 10.6.0 (moves between version bumps)
+#   :sha-<shortsha>  <- immutable per-commit pin: ROLL BACK WITH THIS
+#
+# CIPP reads org.opencontainers.image.version from the manifest annotation (label as
+# fallback) and compares it to $env:APP_VERSION inside the container, so this workflow
+# sets both and bakes APP_VERSION/COMMIT_SHA/IMAGE_TAG via a CI-side COPY of the
+# Dockerfile (the upstream-tracked Dockerfile is never modified).
+
+name: Build and publish CIPP-API container image
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  issues: write # failure-notifier opens/updates an issue
+
+# Serialise: if pull[bot] lands two merges fast, cancel the stale build so :latest can
+# never be overwritten by an OLDER commit finishing last.
+concurrency:
+  group: build-container-master
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    if: github.repository == 'csg-cipp/CIPP-API'   # never run outside the fork
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read and validate version
+        id: version
+        run: |
+          if [ ! -f version_latest.txt ]; then
+            echo "::error::version_latest.txt not found"; exit 1
+          fi
+          VERSION=$(tr -d '[:space:]' < version_latest.txt)
+          if ! printf '%s' "$VERSION" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
+            echo "::error::version_latest.txt is empty or not a valid image tag: '$VERSION'"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create CI Dockerfile (bake runtime version metadata)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+        run: |
+          # APP_VERSION must exactly equal org.opencontainers.image.version below:
+          # CIPP string-compares them for update detection and parses APP_VERSION as
+          # [semver] (plain version only). Written to RUNNER_TEMP so the CI Dockerfile
+          # is not copied into the image.
+          cp Dockerfile "$RUNNER_TEMP/Dockerfile.ci"
+          {
+            echo ''
+            echo '# --- appended by csg-build-container.yml (fork CI only) ---'
+            printf 'ENV APP_VERSION=%s COMMIT_SHA=%s IMAGE_TAG=latest\n' "$VERSION" "$SHORT_SHA"
+          } >> "$RUNNER_TEMP/Dockerfile.ci"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ runner.temp }}/Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          provenance: false   # plain single-manifest push; attestation index trips some pullers
+          sbom: false
+          tags: |
+            ghcr.io/csg-cipp/cipp-api:latest
+            ghcr.io/csg-cipp/cipp-api:${{ steps.version.outputs.version }}
+            ghcr.io/csg-cipp/cipp-api:sha-${{ steps.version.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=CIPP-API
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/csg-cipp/CIPP-API
+            org.opencontainers.image.description=CIPP API container (fork build of KelvinTegelaar/CIPP-API)
+          annotations: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/csg-cipp/CIPP-API
+
+      # Poke the App Service deployment webhook so cippgqivq-proc repulls :latest.
+      # Skipped while AZURE_CONTAINER_WEBHOOK_URL is absent (pre-provisioning). On a
+      # persistent failure this HARD-FAILS so the if:failure() notifier fires — a silent
+      # warning on a green run in an unwatched fork would hide weeks of image staleness.
+      - name: Trigger image repull on cippgqivq-proc
+        if: ${{ success() }}
+        env:
+          WEBHOOK_URL: ${{ secrets.AZURE_CONTAINER_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "AZURE_CONTAINER_WEBHOOK_URL not set - skipping repull trigger."; exit 0
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+               --retry 3 --retry-all-errors --retry-delay 10 \
+               -X POST "$WEBHOOK_URL"
+
+      # csg-cipp inbox is rarely watched; on failure open/update an issue @-mentioning
+      # James-CSG (collaborator, gets participating notifications).
+      - name: Notify on failure (open or update GitHub issue)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'CIPP-API container build or repull failing on master';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '@James-CSG the CIPP-API container image build OR the repull webhook failed.',
+              '', `Commit: ${context.sha}`, `Run: ${runUrl}`, '',
+              'Effect: the image may not have published, or cippgqivq-proc may be running a STALE image.'
+            ].join('\n');
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', creator: 'github-actions[bot]'
+            });
+            const existing = issues.find(i => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo, title, body });
+            }
