@@ -122,6 +122,32 @@ jobs:
                --retry 3 --retry-all-errors --retry-delay 10 \
                -X POST "$WEBHOOK_URL"
 
+      # SECOND poke, ~25 min later, to heal the version-bump durable-table wipe.
+      # On the first boot after a version bump, upstream Clear-CippDurables deletes the
+      # durable hub tables (cippgqivqprocInstances/History) and its single recreate
+      # attempt lands inside Azure's ~40s table-delete cooldown, 409s, and is swallowed
+      # ($null =). A RUNNING host never recreates them (Durable extension creates them at
+      # host START only), so orchestrations stay broken until the next restart — observed
+      # 2026-08-05, fixed then by a manual restart. The wipe fires on first invocation
+      # (profile.ps1 defers; timers force one within 15 min of boot), so by +25 min it has
+      # fired and the Version row matches: this second restart boots clean, no re-wipe,
+      # tables recreated. Harmless no-op on builds without a version bump. If a newer push
+      # cancels this run mid-sleep (concurrency group), the newer run's own repull restart
+      # heals the wipe instead — every path ends in a post-wipe restart.
+      - name: Second repull poke (recreate durable tables after version-bump wipe)
+        if: ${{ success() }}
+        env:
+          WEBHOOK_URL: ${{ secrets.AZURE_CONTAINER_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "AZURE_CONTAINER_WEBHOOK_URL not set - skipping."; exit 0
+          fi
+          echo "Sleeping 25 min so the first boot's wipe (if any) completes first..."
+          sleep 1500
+          curl --fail --silent --show-error --max-time 30 \
+               --retry 3 --retry-all-errors --retry-delay 10 \
+               -X POST "$WEBHOOK_URL"
+
       # csg-cipp inbox is rarely watched; on failure open/update an issue @-mentioning
       # James-CSG (collaborator, gets participating notifications).
       - name: Notify on failure (open or update GitHub issue)
