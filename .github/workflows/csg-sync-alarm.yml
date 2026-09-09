@@ -1,0 +1,154 @@
+# FORK-ONLY workflow for csg-cipp/CIPP-API.
+#
+# Watches for the upstream-sync failure modes that have repeatedly frozen this
+# deployment, and raises a single tracking GitHub issue when any of them trip.
+#
+#   1. Stalled sync   - a pull[bot] PR onto master/main open longer than MAX_PR_AGE_H
+#                       (05 Aug: UNSTABLE for 9 days; 25 Aug: CONFLICTING for 18 days)
+#   2. Version skew   - backend version_latest.txt != the live frontend version.json
+#                       (08 Sep: backend 10.10.0 vs frontend 10.9.1 for ~20h)
+#   3. Failed deploy  - the newest run of either deploy workflow concluded 'failure'
+#                       (08 Sep: Oryx could not satisfy engines.node ^22.22.2)
+#
+# CSG-prefixed filename so it cannot add/add-conflict with an upstream workflow,
+# and fork-only so it survives pull[bot] merges (mergeMethod "merge").
+#
+# Both forks are public, so the built-in GITHUB_TOKEN can read the other repo's
+# pull requests and runs. No PAT and no extra secrets are required.
+
+name: CSG Sync Alarm
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_trip:
+        description: 'Simulate a tripped condition to test the issue path'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+env:
+  API_REPO: csg-cipp/CIPP-API
+  UI_REPO: csg-cipp/CIPP
+  FRONTEND_URL: https://cipp.csgrp.co.uk/version.json
+  MAX_PR_AGE_H: '24'
+  ISSUE_LABEL: sync-alarm
+  ISSUE_TITLE: 'CIPP sync alarm: deployment is stalled or skewed'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run checks
+        id: checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_TRIP: ${{ inputs.force_trip }}
+        run: |
+          set -uo pipefail
+          findings=""
+          add() { findings="${findings}- $1"$'\n'; }
+
+          # --- 1. stalled pull[bot] PRs on the release branches -----------------
+          now=$(date -u +%s)
+          for repo in "$API_REPO" "$UI_REPO"; do
+            prs=$(gh pr list --repo "$repo" --state open \
+                    --json number,author,createdAt,baseRefName,mergeStateStatus,url \
+                    --jq '.[] | select(.author.login=="app/pull")
+                              | select(.baseRefName=="master" or .baseRefName=="main")
+                              | [.number,.createdAt,.baseRefName,.mergeStateStatus,.url] | @tsv' 2>/dev/null) || {
+              add "Could not list PRs for \`$repo\` (GitHub API error) - check manually."; continue; }
+            while IFS=$'\t' read -r num created base state url; do
+              [ -z "${num:-}" ] && continue
+              age=$(( (now - $(date -u -d "$created" +%s)) / 3600 ))
+              if [ "$age" -ge "$MAX_PR_AGE_H" ]; then
+                add "**Stalled sync**: \`$repo\` PR [#$num]($url) onto \`$base\` has been open **${age}h** (state: \`$state\`)."
+              fi
+            done <<< "$prs"
+          done
+
+          # --- 2. backend vs deployed frontend version -------------------------
+          backend=$(tr -d ' \r\n' < version_latest.txt 2>/dev/null || echo "")
+          frontend=$(curl -fsSL --max-time 30 "$FRONTEND_URL" 2>/dev/null | jq -r '.version // empty' || echo "")
+          if [ -z "$backend" ] || [ -z "$frontend" ]; then
+            add "**Version check failed**: backend='${backend:-?}' frontend='${frontend:-unreachable}'."
+          elif [ "$backend" != "$frontend" ]; then
+            add "**Version skew**: backend \`$backend\` vs deployed frontend \`$frontend\`."
+          fi
+
+          # --- 3. most recent deploy run on each release branch ----------------
+          check_run() {
+            local repo="$1" branch="$2" wf="$3" label="$4"
+            local out
+            out=$(gh run list --repo "$repo" --branch "$branch" --workflow "$wf" --limit 1 \
+                    --json conclusion,status,url,createdAt \
+                    --jq '.[0] | [.status,.conclusion,.url,.createdAt] | @tsv' 2>/dev/null) || return 0
+            [ -z "$out" ] && return 0
+            IFS=$'\t' read -r status conclusion url created <<< "$out"
+            if [ "$status" = "completed" ] && [ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ]; then
+              add "**Deploy failed**: $label latest run concluded \`$conclusion\` ([run]($url), $created)."
+            fi
+          }
+          check_run "$API_REPO" master csg-build-container.yml "backend container build"
+          check_run "$UI_REPO"  main   "Azure Static Web Apps CI/CD" "frontend SWA deploy"
+
+          if [ "${FORCE_TRIP:-false}" = "true" ]; then
+            add "**TEST**: \`force_trip\` was set on a manual run - this finding is synthetic."
+          fi
+
+          {
+            echo "tripped=$([ -n "$findings" ] && echo true || echo false)"
+            echo 'findings<<EOF'
+            printf '%s' "${findings:-}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$findings" ]; then echo "TRIPPED:"; printf '%s' "$findings"; else echo "All clear."; fi
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIPPED: ${{ steps.checks.outputs.tripped }}
+          FINDINGS: ${{ steps.checks.outputs.findings }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --repo "$API_REPO" --color B60205 \
+            --description "Upstream sync / deployment health" >/dev/null 2>&1 || true
+
+          existing=$(gh issue list --repo "$API_REPO" --state open --label "$ISSUE_LABEL" \
+                       --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ "$TRIPPED" = "true" ]; then
+            body=$(printf '%s\n\n%s\n\n%s\n' \
+              "The sync alarm tripped at $(date -u '+%Y-%m-%d %H:%M UTC')." \
+              "$FINDINGS" \
+              "Checked by [this run]($RUN_URL). This issue closes automatically once every check passes. See \`CIPP-STATUS-*.md\` for the recovery recipes.")
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$API_REPO" --body "$body"
+              echo "Updated issue #$existing"
+            else
+              n=$(gh issue create --repo "$API_REPO" --title "$ISSUE_TITLE" \
+                    --label "$ISSUE_LABEL" --body "$body" --json number --jq .number 2>/dev/null \
+                  || gh issue create --repo "$API_REPO" --title "$ISSUE_TITLE" \
+                       --label "$ISSUE_LABEL" --body "$body" | tail -1)
+              echo "Opened issue $n"
+            fi
+          else
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$API_REPO" \
+                --body "All checks passed at $(date -u '+%Y-%m-%d %H:%M UTC') - closing. ([run]($RUN_URL))"
+              gh issue close "$existing" --repo "$API_REPO"
+              echo "Closed issue #$existing"
+            else
+              echo "All clear, no open alarm issue."
+            fi
+          fi
